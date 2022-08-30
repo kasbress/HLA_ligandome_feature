@@ -1,0 +1,227 @@
+---
+title: "Generate peptide database"
+author: "Kaspar Bresser"
+date: "22/12/2021"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+```{r startup}
+library(here)
+library(babelgene)
+library(seqinr)
+library(tidyverse)
+library(GGally)
+library(readxl)
+library(Biostrings)
+```
+
+
+## Get RNA expression
+
+We'll first want to check which genes are expressed by the cell line that was used in the manuscript. Analyzed 4 RNAseq samples that were deposited by the authors. Start with reading in the tables. 
+
+```{r read_rna}
+folders <- list.files(here("Broad_Data", "RNAseq"), pattern = "^quasi_")
+
+salmon.results <- tibble(salmon = map(here("Broad_Data", "RNAseq", folders, "quant.sf"), read_tsv),
+                         sample = folders)
+
+salmon.results
+```
+
+
+Check correlation between the samples using `GGally::ggpairs`.
+
+```{r plot_RNAseq, fig.width=8}
+salmon.results %>% 
+  unnest(salmon) %>% 
+  mutate(TPM = log10(TPM+1)) %>% 
+  pivot_wider(id_cols = Name, names_from = sample, values_from = TPM) %>% 
+  ggpairs(columns = 2:5)
+```
+
+
+Consistency between samples looks good. Calculate mean values. 
+
+```{r average_tmp}
+salmon.results %>% 
+  unnest(salmon) %>%
+  group_by(Name) %>% 
+  summarise(TPM = mean(TPM)) %>% 
+  transmute(ensembl_id = str_remove_all(Name, "\\.\\d+"), TPM = TPM) -> rna.expression
+
+rna.expression
+```
+
+Check the amount of expressed genes
+
+```{r check_expressed}
+table(rna.expression$TPM > 0)
+```
+
+Read conversion table, which contains Ensemble transcript and gene IDs, and swissprot IDs.
+
+```{r read_conversion}
+conversion.table <- na.omit(read_tsv(here("Broad_Data", "HLA_peptidomics", "conversion.txt")))
+
+conversion.table
+```
+
+Extract the transcript ID from the ensembl_id column, join with the conversion table, 
+
+```{r join_rna_conversion}
+rna.expression %>% 
+  transmute(`Ensembl Transcript ID` = str_extract(ensembl_id, "ENST\\d+"), TPM = TPM) %>% 
+  left_join(conversion.table) %>% 
+  mutate(ensembl_id = `Ensembl Gene ID`, swissprot_id = `UniProt/SwissProt Accession`) %>% 
+  group_by(ensembl_id) %>% 
+  summarise(TPM = sum(TPM), swissprot_id = unique(swissprot_id)) -> rna.expression
+
+write_tsv(rna.expression, here("Broad_Data", "RNAseq", "averaged_TPM_values_salmon.tsv"))
+```
+
+And extract the expressed protein identifiers. 
+
+```{r get_expressed}
+rna.expression %>% 
+  filter(TPM > 0) %>% 
+  pull(swissprot_id) -> expressed.ids
+
+head(expressed.ids, 15)
+```
+
+
+## Import ligands
+
+
+```{r check_sheets}
+excel_sheets(here("Broad_Data", "HLA_peptidomics", "41587_2019_322_MOESM3_ESM.xlsx"))
+```
+
+
+
+```{r import_ligand_data}
+#alleles <- excel_sheets(here("Broad_Data", "HLA_peptidomics", "41587_2019_322_MOESM3_ESM.xlsx"))[-1]
+alleles <- c("A2402", "A0201", "B3501", "B5101", "A1101", "A3101", "B4001", "B0702")
+excel.file <- here("Broad_Data", "HLA_peptidomics", "41587_2019_322_MOESM3_ESM.xlsx")
+
+tibble(data = map(alleles, ~read_excel(excel.file, sheet = . )), allele = alleles) %>% 
+  mutate(data = map(data, ~select(., sequence, hg19.kgXref.geneSymbol))) -> broad.HLA.data
+  
+broad.HLA.data
+```
+
+Tidy up, and add peptide lengths.
+
+```{r tidy_broad_data}
+broad.HLA.data %>% 
+  unnest(data) %>% 
+  mutate(pep_length = str_length(sequence)) %>% 
+  dplyr::rename(gene.symbol = "hg19.kgXref.geneSymbol") -> broad.HLA.data
+
+broad.HLA.data
+```
+
+Check the amount of 9mers for each allele. 
+
+```{r check_9mers}
+broad.HLA.data %>% 
+  filter(pep_length == 9) %>% 
+  dplyr::count(allele) %>% 
+  arrange(desc(n))
+```
+
+Broad data uses gene symbols, expand the conversion table to include those. 
+
+```{r expand_conversion}
+babelgene::orthologs(genes = na.omit(broad.HLA.data)$gene.symbol, species = "mouse", top = T) %>% 
+  transmute(gene.symbol = human_symbol, ensemble_id =  human_ensembl) %>% 
+  full_join(conversion.table, by = c("ensemble_id" = "Ensembl Gene ID")) %>% 
+  as_tibble() -> conversion.table
+
+conversion.table
+
+```
+
+Select the alleles that have the largest amount of data, and filter on 9mers. 
+
+```{r select_alleles}
+broad.HLA.data %>% 
+  filter(pep_length == 9) %>% 
+  mutate(sequence = str_to_upper(sequence)) %>% 
+  inner_join(conversion.table, na_matches = "never") %>% 
+  distinct(sequence, .keep_all = T) %>% 
+  transmute(sequence = sequence, swissprot_id = `UniProt/SwissProt Accession`, allele = allele, ensembl_id = ensemble_id) -> fitered.peptides
+
+fitered.peptides
+
+write_tsv(fitered.peptides, here("Output", "Broad_peptides.tsv"))
+```
+
+Subsample the peptide pools to get a more workable number, 350 is slightly under the smallest allele-set. Make sure they are expressed and in the library.
+
+```{r subsample}
+here( "Protein_per_Uniprot_entry_library_v2_RBP_GC_length_codon_AA_m6A_m5C_AtoI_m1A_m7G_CD8miRDB_PTM.csv") %>% 
+  read_tsv() %>% 
+  pull(Entry) -> IDs.in.library
+
+fitered.peptides %>% 
+  filter(swissprot_id %in% expressed.ids) %>% 
+  filter(swissprot_id %in% IDs.in.library) %>% 
+  group_by(allele) %>% 
+  slice_sample(n = 350) %>% 
+  ungroup() -> fitered.peptides
+
+fitered.peptides
+
+write_tsv(fitered.peptides, here("Output", "Broad_peptides_subsample.tsv"))
+```
+
+## Select decoys
+
+Import UniProt sequences and filter on expressed genes
+
+```{r import_uniprot}
+uniprot <- read_csv(here("Broad_Data", "HLA_peptidomics", "UniProt_reviewed_input.tsv"))
+
+(uniprot <- filter(uniprot, sequence_id %in% expressed.ids))
+
+```
+
+`tibble::deframe` into a a named character vector, and then create a `Biostrings::AAStringSet`, which can be written as a fasta file using `Biostrings::writeXStringSet`. 
+
+```{r make_databases}
+uniprot %>% 
+  deframe() %>% 
+  AAStringSet(use.names = T) %>% 
+  writeXStringSet(filepath = here("Broad_Data", "HLA_peptidomics", "expressed_proteins.fasta"))
+```
+
+
+
+
+

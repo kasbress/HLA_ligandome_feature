@@ -1,0 +1,129 @@
+---
+title: "Test XGB models on Broad data"
+author: "Kaspar Bresser"
+date: "11/01/2021"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+
+```{r loading}
+library(here)
+library(caret)
+library(xgboost)
+library(tidyverse)
+```
+
+Import the feature library
+
+```{r add_features}
+feature.table <- read_tsv(here( "Protein_per_Uniprot_entry_library_v2_RBP_GC_length_codon_AA_m6A_m5C_AtoI_m1A_m7G_CD8miRDB_PTM.csv")) %>% 
+  mutate(across(everything(), replace_na, 0))
+
+feature.table <- rename(feature.table, ID = Entry)
+```
+
+
+Get the file list, extract the names that will be used as column names
+
+
+```{r get_files}
+files <- list.files(here("XGB_models_final"), pattern = "xgb")
+#files <- c("xgb_ligands|aff_chop_only|11_01_2022.RDS", "xgb_ligands|rna_aff_chop|11_01_2022.RDS")
+
+files %>% 
+  str_extract("\\|.*\\|") %>% 
+  str_remove_all("\\|") -> names
+
+files <- set_names(files, names)
+
+files
+```
+
+Import the XGB models.
+
+```{r get_models}
+files %>% 
+  map(~read_rds(here("XGB_models_final", .))) %>% 
+  set_names(names) -> XGB.models
+
+XGB.models
+```
+
+get column names.
+
+```{r read_column_names}
+here("Output", "Broad_test_set_forXGB.tsv") %>% 
+  read_tsv( n_max = 1) %>% 
+  names() -> column.names
+
+column.names
+```
+
+
+Will import the test set in chunks, perform the predictions with each model and write out the scores in a single pipe to keep from depleting memory. The test set contains 2,802,729 entries.  Read in by chunks of 75,000
+
+```{r get_starts}
+2802729/75000
+
+75000*38
+
+start.points <- seq(0, 2802729, 75000)+1
+
+start.points
+```
+
+Define a function that will import a portion of the test data, rename/retain the columns needed, and join with the feature library.
+
+Next, loop over the start points. In each loop use the subset of the test data to perform predictions with all imported models. Column-bind this to the ligand column of the same partition of the data, and write out.
+
+```{r predictions}
+importstuff <- function(start){
+  here("Output", "Broad_test_set_forXGB.tsv") %>% 
+    read_tsv(skip = start , n_max = 75000, col_names = column.names) %>% 
+    transmute(rna = rna, chop = processing_score, affMIN = Rank, ID = ID) %>% 
+    left_join(feature.table, by = "ID") -> out
+  return(out)
+}
+
+
+for(i in start.points){
+    XGB.models %>% 
+      map2_dfc(list(importstuff(i)) , ~predict(object = .x, newdata = .y, type = "prob")$`TRUE`) %>% 
+      bind_cols(read_tsv(here("Output", "Broad_test_set_forXGB.tsv"),
+                         skip = i, 
+                         n_max = 75000, 
+                         col_names = column.names, 
+                         col_select = c(allele, ligand))) %>% 
+      write_tsv(here("Output", "XGB_final_plus", paste0("prediction_results_", i, ".tsv")))
+  gc()
+}
+```
+
+
+
+
+

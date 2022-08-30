@@ -1,0 +1,140 @@
+---
+title: "Generate test set for XGB models"
+author: "Kaspar Bresser"
+date: "12/01/2021"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+```{r startup}
+library(here)
+library(tidyverse)
+```
+
+
+
+
+First, import the ligands that we'll use as positive cases. 
+
+```{r read_ligands}
+(ligand.table <- read_tsv(here("Output", "Broad_peptides_subsample.tsv")))
+```
+
+Import the swissprot IDs that are in the feature library
+
+```{r import_IDs}
+here( "Protein_per_Uniprot_entry_library_v2_RBP_GC_length_codon_AA_m6A_m5C_AtoI_m1A_m7G_CD8miRDB_PTM.csv") %>% 
+  read_tsv() %>% 
+  pull(Entry) -> IDs.in.library
+```
+
+
+
+Next, define a function that will take the netMHCpan output table for a given allele, plus the allele name. This function will read the file, add the allele name as a column, annotate which peptides are positive cases, and finally subset the dataset to 350 positive and 350,000 negative cases. 
+
+```{r define_import_function}
+
+import_peptides <- function(file, al){
+
+  
+  ligand.table %>% 
+    filter(allele == al) %>% 
+    pull(sequence) -> detected.ligands
+  
+  file %>% 
+    read_tsv(skip = 1) %>% 
+    filter(ID %in% IDs.in.library) %>% 
+    mutate(allele = al) %>% 
+    select( c("Peptide", "ID", "Rank", "allele")) %>% 
+    mutate(ligand = case_when(Peptide %in% detected.ligands ~ TRUE,
+                              TRUE ~ FALSE)) %>% 
+    group_by(ligand) %>% 
+    nest() %>% 
+    ungroup() %>% 
+    mutate(data = map2(data, c(350000, 350), sample_n)) %>% 
+    unnest(data)
+      
+}
+```
+
+Now, get the the files, set the alleles as names, apply the `import_peptides` function and row bind the output into a single table. 
+
+```{r import_peptides}
+file.names <- list.files(here("Broad_Data", "HLA_peptidomics", "netMHCpan"), pattern = "broad")
+
+file.names %>% 
+  here("Broad_Data", "HLA_peptidomics", "netMHCpan", .) %>% 
+  set_names(str_remove(file.names, "_broad.txt")) -> files
+
+files
+
+files %>% 
+  map2(., names(.), import_peptides) %>% 
+  purrr::reduce(bind_rows) -> test.table
+
+test.table
+```
+
+Now we'll add the netChop processing scores. I'll take an old file for which I applied the neolution pipeline (which spits out the processing scores) on all swissprot annotated proteins. 
+
+```{r add_processing_scores}
+here("Broad_Data", "HLA_peptidomics", "swissprot_A0201_9mer.csv") %>% 
+  read_csv() %>% 
+  transmute( Peptide = peptide, processing_score = processing_score) %>%
+  distinct(Peptide, .keep_all = T) %>% 
+  inner_join(test.table, by = "Peptide") -> test.table
+
+test.table
+```
+
+Finally add the RNAseq data. Make sure to z-score normalize
+
+```{r add_rna}
+(TPM.table <- read_tsv(here("Broad_Data", "RNAseq", "averaged_TPM_values_salmon.tsv")))
+
+TPM.table %>% 
+  filter(TPM > 0) %>% 
+  transmute(ID = swissprot_id, rna = TPM) %>% 
+  distinct(ID, .keep_all = T) %>% 
+  mutate(rna = scale(log10(rna))[,1]) %>% 
+  inner_join(test.table, by = "ID") -> test.table
+
+test.table
+
+test.table %>% 
+  ggplot(aes(x = allele, y = rna, fill = ligand))+
+  geom_boxplot()
+```
+
+And write out the file
+
+```{r write_out}
+test.table %>% 
+  write_tsv(here("Output", "Broad_test_set_forXGB1.tsv"))
+
+
+```
+

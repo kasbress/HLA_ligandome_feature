@@ -1,0 +1,191 @@
+---
+title: "XGB results top 0.1% Broad data"
+author: "Kaspar Bresser"
+date: "11/01/2021"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+Used the analysis below to compare the performance of the XGB models.
+
+```{r loading}
+library(here)
+library(bayestestR)
+library(tidyverse)
+```
+
+## Import and tidy data
+
+Import the results table.
+
+```{r import_results}
+here("Output", "XGB") %>% 
+  list.files() %>% 
+  here("Output", "XGB", .) %>% 
+  map(read_tsv) %>% 
+  reduce(bind_rows)  -> XGB.results
+
+XGB.results
+```
+
+Convert the ligand column to a binary so it can be used for cumsum calculation, pivot to longer data by putting the models in a grouped format.
+
+```{r prep_data}
+XGB.results %>% 
+  mutate(detected = case_when(ligand == TRUE ~ 1,
+                              TRUE ~ 0)) %>% 
+  pivot_longer(cols = !c("detected", "ligand", "allele"), 
+               names_to =  "model", 
+               values_to =  "score") -> XGB.results
+
+XGB.results
+```
+
+
+For these analysis we'll focus on the top 0.1% scoring peptides for each model. Let's subset on those. Note that I arrange on both both model scores and a random number for tie breaking.
+
+```{r data_prep3}
+XGB.results %>% 
+  group_by(allele, model) %>% 
+  mutate(random = sample(1:n())) %>% 
+  arrange(desc(score), random, .by_group = T) %>% 
+  slice_head(prop = .001) -> XGB.results
+ 
+XGB.results
+```
+
+
+Next we'll calculate the cumulative sums by grouping by allele and model. 
+
+Note that `cumsum()` takes an ordered dataframe. 
+
+```{r prep_data2}
+XGB.results %>% 
+  group_by(allele, model) %>%
+  mutate(peptides = 1:n(), 
+         detected_ligands = cumsum(detected)) %>% 
+  ungroup() -> XGB.results
+
+XGB.results
+```
+
+
+Lastly, set the ordering in which we'd like the models to appear in plots, by converting the models variable to a factor
+
+```{r data_prep4}
+unique(XGB.results$model)
+
+#model.order <- c("aff_only", "aff_chop_only",  "aff_chop_Library","aff_chop_rna",  "aff_chop_Library_rna")
+
+model.order <- c("aff_only", "aff_chop_only",  "Library_chop_aff","rna_aff_chop",  "Library_rna_chop_aff")
+
+allele.order <- c("A2402", "A0201", "B3501", "B5101", "A1101", "A3101", "B4001", "B0702")
+
+colors <- c("#27aae1", "#6675b8", "#834e9f", "#2bb673", "#2e7a3c")
+
+XGB.results %>% 
+  filter(model %in% model.order) %>% 
+  mutate(model = as_factor(model),
+         model = fct_relevel(model, model.order),
+         allele = as_factor(allele),
+         allele = fct_relevel(allele, allele.order)) -> XGB.results
+
+XGB.results
+```
+
+
+## Positive predictive value
+
+Lets first plot the positive predictive value (PPV), i.e. the number of true positives within a certain threshold. Calculate the PPV as the number of true positives divided by the total number of peptides within the selected pool.
+
+```{r PVV_plot_increment, fig.width=10}
+XGB.results %>%  
+  group_by(allele, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+   ggplot( aes(x = allele, y = PPV, fill = model)) +
+    geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+    scale_fill_manual(values = colors)+
+    ggtitle("PPV in top 0.1%")+
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_Ext_PPV_bar_final.pdf"), width = 4, height = 2, scale = 2)
+```
+
+Can also plot the PPV on a continuous scale across the top 0.1%. 
+
+```{r plot_peptides_found_continuous, fig.width=8, fig.asp=.9}
+XGB.results %>% 
+  filter(model %in% model.order) %>% 
+    ggplot(aes(x = peptides, y = detected_ligands/peptides, color = model))+
+    geom_line(size = 1)+
+    scale_color_manual(values = colors)+
+    facet_wrap(~allele, scales = "free", nrow = 4)+
+    theme_classic()+
+    theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_Ext_PPV_line_final.pdf"), width = 4, height = 4, scale = 2)
+```
+
+## Cumulative sums
+
+We can additionally plot the cumulative sums of all models.
+
+```{r plot_peptides_found, fig.width=8, fig.asp=.9}
+XGB.results %>% 
+  filter(model %in% model.order) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands, color = model))+
+  geom_line(size = 1)+
+  scale_color_manual(values = colors)+
+  facet_wrap(~allele, scales = "free", nrow = 4)+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_Ext_cumsum_final.pdf"), width = 4, height = 4, scale = 2)
+```
+
+## Area under the curve
+
+Or calculate the AUC of these curves as a summary metric and plot that. Used the `area_under_curve()` function from the [bayestestR](https://easystats.github.io/bayestestR/index.html) package. 
+
+```{r plot_auc, fig.width=10, fig.asp=.45}
+XGB.results %>% 
+  group_by(allele, model) %>% 
+  summarise(auc = area_under_curve(peptides, peptides)) %>% 
+  distinct(auc)
+
+XGB.results %>% 
+  group_by(allele, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands) / 61249.5) %>% 
+  ggplot( aes(x = allele, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  scale_fill_manual(values = colors)+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_Ext_AUC_final.pdf"), width = 5, height = 2, scale = 2)
+```
