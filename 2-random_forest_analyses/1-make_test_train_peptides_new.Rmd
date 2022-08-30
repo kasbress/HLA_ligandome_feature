@@ -1,0 +1,233 @@
+---
+title: "Make test and train sets"
+author: "Kaspar Bresser"
+date: "04/10/2021"
+output: 
+#  github_document:
+#    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+Used the code below to generate the train and test sets used for the random forests.
+
+```{r loading}
+library(here)
+library(caret)
+library(biomaRt)
+library(tidyverse)
+```
+
+# Import MS detected peptides
+
+Read the MS detected peptides into a nested tibble, then unnest and select the columns we want to continue with. Also, only keep unique cases. 
+
+```{r read_ligands}
+file.names <- list.files(here("Data", "MS_peptides")) 
+
+HLA.ligands <- tibble(
+  
+  ligand.table = map( here("Data", "MS_peptides", file.names), read_tsv ),
+  tumor = map_chr(str_split(file.names, "_"), 1)
+
+  )
+
+HLA.ligands
+
+# Define Columns to keep from the ligand tables
+keep <- c("rna","ribo", "chop", "affMIN", "swissprot_id", "ligand", "peptide", "peptide_length")
+
+HLA.ligands %>% 
+  unnest( cols = ligand.table) %>% 
+  select(one_of(keep, "tumor")) %>% 
+  distinct() -> HLA.ligands
+
+HLA.ligands
+
+
+```
+
+# Import decoy peptides
+
+Next we'll import the decoys that we'll use during training and testing. I've got all possible 9, 10 and 11mers of each tumor line stored in individual files in the /Data folder. As it would be a bit heavy to import all of that, I usually use the code snippet below to first randomly select the amount of peptides I'd like to import and store those as a tmp_file. Then I read in the tmp_file, remove it and repeat for the the next tumor.
+
+Count the nr of ligands of each length and multiply that by the factor of excess we'd like to have. For this iteration I'll create a train set that has a 1:10 dilution in decoys and a test set that has a 1:1000 dilution. Importing a 1200-fold excess should be enough to create those sets. 
+
+Next build the file paths using `here::here()`. 
+
+Pass a series of commands via `system()`. First, use `head -n 1` to get the header line, and write it to the tmp_file. Second, use `tail -n +2` to select the entire file, except the header and pipe this to the `shuf` command. This latter command randomly selects the nr of peptides we desire. This we can write to the tmp_file. Lastly, we can import those peptides, and delete the tmp_file, starting over with the next batch of peptides. 
+
+```{r read_decoys}
+decoys.list <- list()
+for(tum in c("mel95", "M026", "RTE")){
+  
+  HLA.ligands %>% 
+    filter(tumor == tum) %>% 
+    count(peptide_length) %>% 
+    deframe() -> ligand.counts
+  to.import <- ligand.counts*600
+  
+  file.paths <- here("Data", tum, paste0(tum, "_", c(9,10,11), "mers.txt" ))
+  
+
+  # Import 9mers
+  system(  paste0("head -n 1 ",file.paths[1] ," > ", here("Data", "tmp_file.txt"))  )
+  system( paste0("tail -n +2 ",file.paths[1] , " | shuf -n ", to.import[1], " >> ", here("Data", "tmp_file.txt")) )
+  
+  decoys <- read_tsv( here("Data", "tmp_file.txt"), col_names = TRUE)
+  system(paste0("rm ", here("Data", "tmp_file.txt")))
+  
+  # Import 10mers
+  system(  paste0("head -n 1 ",file.paths[2] ," > ", here("Data", "tmp_file.txt"))  )
+  system( paste0("tail -n +2 ",file.paths[2] , " | shuf -n ", to.import[2], " >> ", here("Data", "tmp_file.txt")) )
+  
+  decoys <- bind_rows(decoys, read_tsv(here("Data", "tmp_file.txt"), col_names = TRUE))
+  system(paste0("rm ", here("Data", "tmp_file.txt")))
+  
+  # Import 11mers
+  system(  paste0("head -n 1 ",file.paths[3] ," > ", here("Data", "tmp_file.txt"))  )
+  system( paste0("tail -n +2 ",file.paths[3] , " | shuf -n ", to.import[3], " >> ", here("Data", "tmp_file.txt")) )
+  
+  decoys <- bind_rows(decoys, read_tsv(here("Data", "tmp_file.txt"), col_names = TRUE))
+  system(paste0("rm ", here("Data", "tmp_file.txt")))
+  
+  
+  decoys <- decoys[,keep]
+  decoys.list[[tum]] <- decoys
+}
+
+decoys.list
+```
+
+
+Now combine the ligands and decoys into a master table. 
+
+```{r make_master_table}
+decoys.list %>% 
+  enframe("tumor", "decoys") %>% 
+  unnest(cols = decoys) %>% 
+  bind_rows(HLA.ligands) -> master.table
+
+master.table
+
+# clean-up
+rm(list = c("decoys", "decoys.list", "HLA.ligands"))
+```
+
+# Check if mappable
+
+Before partitioning into train/test we'd like to make sure that all peptides in the master table can be matched to the feature table. Can use `semi_join` to remove all rows that would not have a match. 
+
+Import the feature table and perform the join.
+
+```{r import_features}
+feature.table <- read_tsv(here("Data", "Protein_per_Uniprot_entry_library_v2_RBP_GC_length_codon_AA_m6A_m5C_AtoI_m1A_m7G_CD8miRDB_PTM.csv"))
+
+dim(master.table)
+
+master.table <- semi_join(master.table, feature.table, by = c("swissprot_id" = "Entry"))
+
+dim(master.table)
+```
+
+
+# Sample test/train sets
+
+Now sample peptides for the train set. First create an object containing the number of MS peptides per tumor, per length. 
+
+As we want to sample variably based on MS-peptide/decoy identity (stored in 'ligand' column), as well as by tumor and peptide length, we'll nest on those variables so we can sample from those tibbles. Join with the MS peptide numbers, and create a column (for.train) setting the amount of rows we'd like to sample. We'll take 80% for training, and add an excess of 10 decoys for each MS peptide. 
+
+Having set the numbers we want, use `purrr:map2()` to iterate the `sample_n()` function over the tibbles, using the for.train column to set the number of rows to sample. 
+
+Finally remove excess columns, and unnest.
+
+
+```{r make_train_table}
+# First create a table storing the amount of peptides that we want to sample
+master.table %>% 
+#  filter(ligand == TRUE) %>% 
+  count(ligand, tumor, peptide_length) %>% 
+  group_by(peptide_length) %>% 
+  # will down-sample all tumors to the smallest data-set 
+  mutate(to.sample = min(n) ) %>%  
+  mutate(for.train = case_when(ligand == FALSE ~ floor((to.sample*0.8))*10,
+                               ligand == TRUE ~ floor(to.sample*0.8))) %>% 
+  mutate(for.test = case_when(ligand == FALSE ~ floor(to.sample*0.2)*1000,
+                               ligand == TRUE ~ floor(to.sample*0.2))) %>%
+  ungroup() -> nr.of.MS.peptides
+
+nr.of.MS.peptides
+
+master.table %>% 
+  group_by(ligand, tumor, peptide_length) %>% 
+  nest() %>% 
+  ungroup() %>% 
+  left_join(nr.of.MS.peptides) %>% 
+  mutate(sampled = map2(data, for.train, sample_n)) %>% 
+  dplyr::select(-c("for.train", "for.test", "data", "n", "to.sample")) %>% 
+  unnest(cols = "sampled") -> train.peptides
+
+train.peptides %>% 
+  count(tumor,ligand)
+```
+
+
+Remove the peptides sampled for the train set from the master table.
+
+```{r remove_train_set}
+nrow(master.table)
+
+master.table %>% 
+  dplyr::setdiff( train.peptides) -> master.table
+
+nrow(master.table)
+```
+
+Using the same approach as above, sample the test set.
+
+```{r make_test_table}
+master.table %>% 
+  group_by(ligand, tumor, peptide_length) %>% 
+  nest() %>% 
+  ungroup() %>% 
+  left_join(nr.of.MS.peptides) %>% 
+  mutate(sampled = map2(data, for.test, sample_n)) %>% 
+  dplyr::select(-c("for.test","for.train" , "data", "n", "to.sample")) %>% 
+  unnest(cols = "sampled") -> test.peptides
+
+test.peptides %>% 
+  count(tumor,ligand)
+```
+
+
+
+```{r write_files}
+write_tsv(train.peptides, here("Output","test_train_tables_new", "rf_train_peptides.tsv"))
+write_tsv(test.peptides, here("Output","test_train_tables_new", "rf_test_peptides.tsv"))
+
+
+train.peptides %>% 
+  left_join(feature.table, by = c("swissprot_id" = "Entry")) %>% 
+  write_tsv( here("Output","test_train_tables_new", "rf_train_peptides_full.tsv"))
+
+test.peptides %>% 
+  left_join(feature.table, by = c("swissprot_id" = "Entry")) %>% 
+  write_tsv( here("Output","test_train_tables_new", "rf_test_peptides_full.tsv"))
+```
+

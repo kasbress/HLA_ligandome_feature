@@ -1,0 +1,370 @@
+---
+title: "XGB results top 0.1%"
+author: "Kaspar Bresser"
+date: "28/12/2021"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+Used the analysis below to compare the performance of the XGB models.
+
+```{r loading}
+library(here)
+library(bayestestR)
+library(tidyverse)
+```
+
+## Import and tidy data
+
+Import the results table.
+
+```{r import_results}
+here("Output", "XGB_final") %>% 
+  list.files() %>% 
+  here("Output", "XGB_final", .) %>% 
+  map(read_tsv) %>% 
+  reduce(bind_rows) %>% 
+  mutate(tumor = fct_recode(tumor, M026.X1 = "M026", SKMEL95 = "mel95", NKIRTIL006 = "RTE")) -> XGB.results
+
+XGB.results
+
+XGB.results %>% 
+  count(ligand, tumor)
+```
+
+Convert the ligand column to a binary so it can be used for cumsum calculation, pivot to longer data by putting the models in a grouped format.
+
+```{r prep_data}
+XGB.results %>% 
+  mutate(detected = case_when(ligand == TRUE ~ 1,
+                              TRUE ~ 0)) %>% 
+  pivot_longer(cols = !c("detected", "ligand", "tumor"), 
+               names_to =  "model", 
+               values_to =  "score") -> XGB.results
+
+XGB.results
+```
+
+
+For these analysis we'll focus on the top 0.1% scoring peptides for each model. Let's subset on those. Note that I arrange on both both model scores and a random number for tie breaking.
+
+```{r data_prep3}
+XGB.results %>% 
+  group_by(tumor, model) %>% 
+  mutate(random = sample(1:n())) %>% 
+  arrange(desc(score), random, .by_group = T) %>% 
+  slice_head(prop = .001) -> XGB.results
+ 
+XGB.results
+```
+
+
+Next we'll calculate the cumulative sums by grouping by tumor and model. 
+
+Note that `cumsum()` takes an ordered datafame. 
+
+```{r prep_data2}
+XGB.results %>% 
+  group_by(tumor, model) %>%
+  mutate(peptides = 1:n(), 
+         detected_ligands = cumsum(detected)) %>% 
+  ungroup() -> XGB.results
+
+XGB.results
+```
+
+
+Lastly, set the ordering in which we'd like the models to appear in plots, by converting the models variable to a factor
+
+```{r data_prep4}
+unique(XGB.results$model)
+
+model.order <- c("aff_only", "aff_chop_only", "aff_chop_Library", "aff_chop_rna", 
+                 "aff_chop_ribo", "aff_chop_rna_ribo", "aff_chop_Library_rna", "aff_chop_Library_ribo",
+                 "aff_chop_Library_rna_ribo")
+
+XGB.results %>% 
+  mutate(model = as_factor(model),
+         model = fct_relevel(model, model.order)) -> XGB.results
+
+XGB.results
+```
+
+
+## Positive predictive value
+
+Lets first plot the positive predictive value (PPV), i.e. the number of true positives within a certain threshold. Calculate the PPV as the number of true positives divided by the total number of peptides within the selected pool.
+
+```{r PVV_plot_bars_all, fig.width=6}
+XGB.results %>%  
+  group_by(tumor, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+ggplot( aes(x = tumor, y = PPV, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("PPV in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_PPV_bar_all_final.pdf"), width = 4, height = 2, scale = 2)
+```
+
+Plot improvement gained with library:
+
+```{r PVV_plot_bars_core, fig.width=6}
+core.models <- c("aff_only", "aff_chop_only", "aff_chop_Library")
+
+XGB.results %>%  
+  filter(model %in% core.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+ggplot( aes(x = tumor, y = PPV, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("PPV in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_PPV_bar_core_final.pdf"), width = 3, height = 2, scale = 2)
+```
+
+Compare with expression
+
+```{r PVV_plot_bars_expression, fig.width=6}
+expr.models <- c("aff_chop_only", "aff_chop_Library","aff_chop_rna", 
+                 "aff_chop_ribo", "aff_chop_rna_ribo" )
+
+XGB.results %>%  
+  filter(model %in% expr.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+ggplot( aes(x = tumor, y = PPV, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("PPV in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_PPV_bar_expression_final.pdf"), width = 3, height = 2, scale = 2)
+```
+
+And the combined:
+
+```{r PVV_plot_bars_combined, fig.width=6}
+comb.models <- c("aff_chop_only", "aff_chop_Library","aff_chop_Library_rna", "aff_chop_Library_ribo",
+                 "aff_chop_Library_rna_ribo" )
+
+XGB.results %>%  
+  filter(model %in% comb.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+ggplot( aes(x = tumor, y = PPV, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("PPV in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_PPV_bar_combined_final.pdf"), width = 3, height = 2, scale = 2)
+```
+
+
+
+
+Can also plot the PPV on a continuous scale across the top 0.1%. 
+
+```{r PPV_continuous_all, fig.width=12, fig.asp=.4}
+XGB.results %>% 
+  filter(model %in% model.order) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands/peptides, color = model))+
+  geom_line(size = 1)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_PPV_line_all_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+Core models:
+
+```{r PPV_continuous_core, fig.width=12, fig.asp=.4}
+XGB.results %>% 
+  filter(model %in% core.models) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands/peptides, color = model))+
+  geom_line(size = 1)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_PPV_line_core_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+
+```{r PPV_continuous_expr, fig.width=12, fig.asp=.4}
+XGB.results %>% 
+  filter(model %in% expr.models) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands/peptides, color = model))+
+  geom_line(size = 1)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_PPV_line_expr_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+
+```{r PPV_continuous_comb, fig.width=12, fig.asp=.4}
+XGB.results %>% 
+  filter(model %in% comb.models) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands/peptides, color = model))+
+  geom_line(size = 1)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_PPV_line_expr_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+## Cumulative sums
+
+We can additionally plot the cumulative sums of all models.
+
+```{r plot_cumsum_all, fig.width=12, fig.asp=.4}
+XGB.results %>% 
+  filter(model %in% model.order) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands, color = model))+
+  geom_line(size = 1)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_cumsum_all_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+
+Core models:
+
+```{r plot_cumsum_core, fig.width=12, fig.asp=.4}
+XGB.results %>% 
+  filter(model %in% core.models) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands, color = model))+
+  geom_line(size = 1)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_cumsum_core_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+```{r plot_cumsum_expr, fig.width=12, fig.asp=.4}
+XGB.results %>% 
+  filter(model %in% expr.models) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands, color = model))+
+  geom_line(size = 1)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_cumsum_expr_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+```{r plot_cumsum_comb, fig.width=12, fig.asp=.4}
+XGB.results %>% 
+  filter(model %in% comb.models) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands, color = model))+
+  geom_line(size = 1)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_cumsum_comb_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+
+## Area under the curve
+
+Or calculate the AUC of these curves as a summary metric and plot that. Used the `area_under_curve()` function from the [bayestestR](https://easystats.github.io/bayestestR/index.html) package. 
+First check maximum AUC to normalize between 0 and 1.
+
+```{r plot_auc_all, fig.width=10, fig.asp=.45}
+XGB.results %>% 
+  group_by(tumor, model) %>% 
+  summarise(auc = area_under_curve(peptides, peptides)) %>% 
+  distinct(auc)
+
+XGB.results %>% 
+  group_by(tumor, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands) / 357857.5) %>% 
+  ggplot( aes(x = tumor, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_AUC_all_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+Core models:
+
+```{r plot_auc_core, fig.width=10, fig.asp=.45}
+XGB.results %>% 
+  filter(model %in% core.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands / 357857.5)) %>% 
+  ggplot( aes(x = tumor, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_AUC_core_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+```{r plot_auc_expr, fig.width=10, fig.asp=.45}
+XGB.results %>% 
+  filter(model %in% expr.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands / 357857.5)) %>% 
+  ggplot( aes(x = tumor, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_AUC_expr_final.pdf"), width = 6, height = 2, scale = 2)
+```
+
+
+```{r plot_auc_comb, fig.width=10, fig.asp=.45}
+XGB.results %>% 
+  filter(model %in% comb.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands / 357857.5)) %>% 
+  ggplot( aes(x = tumor, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_AUC_comb_final.pdf"), width = 6, height = 2, scale = 2)
+```
+

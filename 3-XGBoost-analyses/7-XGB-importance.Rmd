@@ -1,0 +1,267 @@
+---
+title: "Check importance XGB models"
+author: "Kaspar Bresser"
+date: "04/03/2022"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 9,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+
+Applied the analyses below to examine the importance of the various features to the XGBoost model. Will look at both models including the feature library.
+
+Import packages. 
+
+
+```{r loading}
+library(here)
+library(caret)
+library(xgboost)
+library(tidytext)
+library(ggpointdensity)
+library(gghighlight)
+library(ggrepel)
+library(tidyverse)
+```
+
+
+Get file names of models using the feature library.
+
+```{r import_models}
+files <- list.files(here("XGB_models_final"), pattern = "aff")
+
+files %>% 
+  str_extract("\\|.*\\|") %>% 
+  str_remove_all("\\|") -> names
+
+files <- set_names(files, names)
+
+files
+```
+
+Import the models
+
+```{r import_models2}
+files %>% 
+  map(~read_rds(here("XGB_models_final", .))) %>% 
+  set_names(names) -> XGB.models
+
+XGB.models
+```
+
+Plot the model metrics. 
+
+```{r get_metrics}
+XGB.models %>% 
+  map( "results") %>% 
+  reduce(bind_rows) %>% 
+  mutate(model = names) -> model.metrics 
+
+model.metrics
+
+model.metrics %>% 
+  pivot_longer(8:11, names_to = "metric", values_to = "value") %>%
+  mutate(which = case_when(str_detect(metric, "SD") ~ "SD",
+                           TRUE ~ "value"),
+         metric = str_remove(metric, "SD")) %>% 
+  pivot_wider(names_from = which, values_from = "value") -> to.plot
+
+to.plot
+
+model.order <- c("aff_only", "aff_chop_only", "aff_chop_Library", "aff_chop_rna", 
+                 "aff_chop_ribo", "aff_chop_rna_ribo", "aff_chop_Library_rna", "aff_chop_Library_ribo",
+                 "aff_chop_Library_rna_ribo")
+
+to.plot %>% 
+  mutate(model = as_factor(model),
+         model = fct_relevel(model, model.order)) -> to.plot
+```
+
+```{r plot_metrics, fig.width=8, fig.asp=.35}
+ggplot(to.plot, aes(x=model, y=value, fill=model)) + 
+  geom_bar(stat="identity", color="black", position=position_dodge(), width = .75) +
+  geom_errorbar(aes(ymin=value, ymax=value+SD), width=.2,
+                 position=position_dodge(.9))+
+  facet_wrap(~metric, scales = "free_y", nrow = 1)+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_model_metrics.pdf"), width = 90, height = 40, units = "mm", scale = 4)
+```
+
+Get the importance scores for the library model.
+
+```{r get_importance}
+importance.scores <- varImp(XGB.models[["aff_chop_Library"]] )
+
+
+importance.scores$importance %>% 
+  as_tibble(rownames = "feature") %>% 
+  dplyr::filter(Overall != 0) %>% 
+  mutate(log10.importance = log10(Overall)) -> importance.scores
+```
+
+Plot the scores, and highlight the top 20.
+
+```{r importance_plots, fig.width=5, fig.asp=.9}
+
+importance.scores %>% 
+  mutate(feature = reorder(feature, log10.importance)) %>% 
+ggplot(aes(x = feature, y = log10.importance, label = feature))+
+    geom_point()+
+    theme_classic()+
+    geom_point(data = slice_max(importance.scores, log10.importance, n = 20 ), color = "darkred")+
+    geom_text_repel(data = slice_max(importance.scores, log10.importance, n = 20 ), 
+                    box.padding = 1.4, max.overlaps = 25, color = "darkred", size = 4)+
+    theme(axis.text.x=element_blank(),
+          axis.ticks.x=element_blank(), panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_importance_pointlabel.pdf"), width = 75, height = 40, units = "mm", scale = 4)
+```
+
+
+
+Get the importance scores from the randomforest model, and select the top 20 of each class. 
+
+```{r}
+read_rds(here("Output", "RF_per_tumor_new.rds")) %>% 
+  mutate(importance = map(rf.models, varImp),
+         importance = map(importance, "importance"),
+         importance = map(importance, as_tibble, rownames = "feature")) %>% 
+  select(tumor, classes, importance) %>% 
+  unnest(importance ) %>% 
+  select(-no) %>% 
+  rename(importance = yes) -> rf.importance.table
+
+rf.importance.table %>% 
+  group_by(classes, feature) %>% 
+  summarise(score = sum(importance)) %>% 
+  inner_join(importance.scores) %>% 
+  slice_max(score, n = 10) -> top.important
+```
+
+Reformat, and plot, highlighting the features that were in the top 20 of the randomforest models. 
+
+```{r plot_classes, fig.width=10}
+importance.scores %>% 
+  left_join(top.important) %>% 
+  mutate(classes = replace_na(classes, "none"),
+         feature.label = str_remove_all(feature, "UTR5|UTR3|CDS|count|hsa|\\."),
+         feature.label = str_replace_all(feature.label, "_", " "),
+         feature = reorder(feature, log10.importance)) -> to.plot
+
+to.plot
+
+ggplot(to.plot, aes(x = feature, y = log10.importance, label = feature.label))+
+  geom_point(size = NA)+
+  geom_point(data = to.plot %>% filter(classes == "none"), color = "darkgrey")+
+  geom_point(data = to.plot %>% filter(classes != "none"), aes(color = classes))+
+  geom_text_repel(data = to.plot %>% filter(classes != "none"), aes(color = classes), 
+                    box.padding = 1.4, max.overlaps = 25, size = 4)+
+  theme_classic()+
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_importance_classes.pdf"), width = 90, height = 55, units = "mm", scale = 4)      
+```
+
+```{r fig.width=4}
+to.plot %>% 
+  mutate(classes = as_factor(classes)) %>% 
+  mutate(classes = fct_relevel(classes, "none", "UTR5", "CDS", "UTR3", "hsa", "count")) %>% 
+ggplot(aes(x = classes, y = log10.importance, color = classes))+
+  geom_boxplot(color = "darkgrey", outlier.shape = NA)+
+  geom_jitter(width = .15)+
+#  geom_text_repel(data = filter(to.plot, classes != "none") %>% group_by(classes) %>%  slice_max(Overall, n = 3), 
+#                  aes(color = classes, label = feature.label), 
+#                    box.padding = 1.4, max.overlaps = 25, size = 4)+
+  scale_color_manual(values = c("grey", "#a11d21", "#de3c26", "#f7921f", "#f5db11", "#b3d343"))+
+  geom_hline(data = filter(to.plot, classes == "none"),
+             aes(yintercept = median(log10.importance)), 
+             linetype ="dashed" )+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_importance_compare_RF.pdf"), units = "mm", width = 100, height = 45, scale = 1.5)
+```
+
+
+
+
+
+Make a boxplot comparing the importance of the different classes of features.
+
+```{r}
+importance.scores %>% 
+  filter(!(feature %in% c("affMIN", "chop"))) %>% 
+    mutate(classes = case_when(str_detect(feature, "UTR5") ~ "5' UTR",
+                                  str_detect(feature, "UTR3") ~ "3' UTR",
+                                  str_detect(feature, "count") ~ "PTM",
+                                  str_detect(feature, "CDS") ~ "CDS",
+                                  str_detect(feature, "hsa") ~ "miR",
+                                  TRUE ~ "total")) %>% 
+  mutate(feature = reorder(feature, log10.importance)) -> to.plot
+
+
+ggplot(to.plot, aes(x = classes, y = log10.importance, color = classes))+
+  geom_boxplot(color = "darkgrey", outlier.shape = NA)+
+  geom_jitter(width = .2)+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(here("Figs", "XGB_importance_classes_compared.pdf"), width = 70, height = 55, units = "mm", scale = 4)  
+
+```
+
+
+
+New analysis
+
+
+```{r}
+varImp(XGB.models[[2]])[["importance"]] %>% 
+  as_tibble(rownames = "feature") %>% 
+  mutate(model = "full") -> tmp
+
+varImp(XGB.models[[4]])[["importance"]] %>% 
+  as_tibble(rownames = "feature") %>% 
+  mutate(model = "part") %>% 
+  bind_rows(tmp) %>% 
+  pivot_wider(names_from = model, values_from = Overall)-> tmp
+
+tmp
+```
+
+
+```{r , fig.width=5}
+tmp %>% 
+  ggplot(aes(x = log10(part), y = log10(full)))+
+  geom_point()+
+  theme_classic()+
+  theme(panel.grid.major = element_line())
+```
+
+
+
